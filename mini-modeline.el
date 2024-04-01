@@ -74,7 +74,7 @@
   :type 'boolean
   :group 'mini-modeline)
 
-(defcustom mini-modeline--enhance-visual t
+(defcustom mini-modeline--enhance-visual nil
   "Enhance minibuffer and window's visibility."
   :type 'boolean
   :group 'mini-modeline)
@@ -126,6 +126,8 @@ Set this to the minimal value that doesn't cause truncation."
 (defvar-local mini-modeline--face-cookie nil)
 (defun mini-modeline--set-buffer-face ()
   "Set buffer default face for current buffer."
+  ;; (set (make-local-variable 'face-remapping-alist)
+  ;;      '((default :height 0.9)))
   (setq mini-modeline--face-cookie
         (face-remap-add-relative 'default mini-modeline--face-attr)))
 
@@ -166,6 +168,8 @@ Set this to the minimal value that doesn't cause truncation."
   (call-interactively 'other-window)
   (switch-to-buffer " *Echo Area 0*")
   (call-interactively 'other-window))
+
+(defvar mini-modeline--last-resize (current-time))
 
 (defsubst mini-modeline--overduep (since duration)
   "Check if time already pass DURATION from SINCE."
@@ -235,6 +239,7 @@ Return value is (STRING . LINES)."
     (cons (string-join re "\n") result-lines)))
 
 (defvar mini-modeline--unprocessed-message '())
+(defvar mini-modeline-content-left-last nil)
 
 (defun mini-modeline--display (&optional force keep-msg)
   "Update mini-modeline."
@@ -250,8 +255,12 @@ Return value is (STRING . LINES)."
                 (let (mini-modeline-content-left
                       mini-modeline-content)
                   ;; (message-log nil "mini-modeline--display, command state %s" mini-modeline--idle)
-                  (setq mini-modeline-content-left (string-join mini-modeline--unprocessed-message "\n"))
-                  (setq mini-modeline-content (mini-modeline--multi-lr-render
+                  ;; (message-log t "current msg: %s" (current-message))
+                  (setq mini-modeline-content-left (or (and mini-modeline--unprocessed-message
+                                                            (string-join mini-modeline--unprocessed-message "\n"))
+                                                       mini-modeline-content-left-last))
+                  (setq mini-modeline-content-left-last mini-modeline-content-left
+                        mini-modeline-content (mini-modeline--multi-lr-render
                                                (or mini-modeline-content-left (format-mode-line mini-modeline--l-format))
                                                (format-mode-line mini-modeline--r-format)))
                   (unless keep-msg
@@ -282,6 +291,7 @@ Return value is (STRING . LINES)."
          ;; (max-mini-window-height 0.5)
          (cursor-in-echo-area t)
          (resize-mini-windows t))
+    ;; when it's not echoing anything, the echo area displays the buffer  *Minibuf-0* (note that the buffer name starts with a space).
     (with-current-buffer mini-modeline-buffer
       (erase-buffer)
       (insert (car mini-modeline-content))
@@ -290,7 +300,10 @@ Return value is (STRING . LINES)."
       ;; (when (> height-delta-diff 0)
       ;;   ;; (> mini-modeline-content-height (window-height mini-modeline-window)
       ;;   (delete-region (point-min) (progn (forward-line height-delta-diff) (point))))
-      (when (> height-delta 0)
+      ;; don't shrink the minibuffer too often, which causes windows flashing
+      (when (or (> height-delta 0)
+                (and (mini-modeline--overduep mini-modeline--last-resize 2)))
+        (setq mini-modeline--last-resize (current-time))
         ;; (window--resize-mini-window mini-modeline-window height-delta)
         (window-resize mini-modeline-window height-delta)))))
 
@@ -301,7 +314,8 @@ Return value is (STRING . LINES)."
   (let* ((inhibit-message t)
          (msg (apply func args)))
     ;; (replace-regexp-in-string "%" "%%" (substring msg 0 max-message-length))
-    (unless (string-empty-p msg)
+    (unless (and (string-empty-p msg)
+                 (equal msg (car (last mini-modeline--unprocessed-message))))
       ;; todo delete trailing spaces and blank lines
       (add-to-list 'mini-modeline--unprocessed-message msg t)
       ;; (message-log nil "Reroute message %s minibuffer active: %s input pending: %s"
@@ -328,8 +342,18 @@ BODY will be supplied with orig-func and args."
   "Post command hook of mini-modeline."
   ;; (message-log t "post-cmd %s %s" (string-join mini-modeline--unprocessed-message "\n") (current-buffer))
   (setq mini-modeline--idle t)
-  (mini-modeline--display)
+  ;; (unless (current-message)
+  ;;   (mini-modeline--display))
+  ;; remove flashing, the post-command-hook is called too often, eg. in eldoc-mode
+  (when (mini-modeline--overduep mini-modeline--last-update-time mini-modeline-update-interval)
+    (when (timerp mini-modeline--timer) (cancel-timer mini-modeline--timer))
+    (mini-modeline--display))
   (setq echo-keystrokes mini-modeline--echo-keystrokes))
+
+(defsubst mini-modeline--post-insert ()
+  "Post insert hook of mini-modeline."
+  (when (timerp mini-modeline--timer) (cancel-timer mini-modeline--timer))
+  (mini-modeline--display 'force))
 
 (defvar mini-modeline--orig-resize-mini-windows resize-mini-windows)
 (defsubst mini-modeline--enter-minibuffer ()
@@ -340,7 +364,7 @@ BODY will be supplied with orig-func and args."
 
 (defsubst mini-modeline--exit-minibuffer ()
   "`minibuffer-exit-hook' of mini-modeline."
-  (setq resize-mini-windows mini-modeline--orig-resize-mini-windows)
+  (setq resize-mini-windows nil)
   (mini-modeline--display))
 
 (declare-function anzu--cons-mode-line "ext:anzu")
@@ -386,23 +410,28 @@ BODY will be supplied with orig-func and args."
             'mini-modeline--mode-line-inactive
             (default-value 'face-remapping-alist) face-remaps)))
 
-  (setq resize-mini-windows mini-modeline--orig-resize-mini-windows)
+  (setq resize-mini-windows nil)
   (redisplay)
 
   (defvar mini-modeline--timer nil)
-  ;; (setq mini-modeline--timer (run-with-idle-timer 0.1 t #'mini-modeline--display))
+  (defvar mini-modeline--idle-timer nil)
+
+  (setq mini-modeline--idle-timer (run-with-idle-timer 5 t #'mini-modeline--display))
 
   (setq message-original (symbol-function 'message))
   (advice-add #'message :around #'mini-modeline--reroute-msg)
   (advice-add #'force-mode-line-update :after #'mini-modeline--display)
 
-  (add-hook 'focus-in-hook 'mini-modeline--display)
+  (add-hook 'focus-out-hook 'mini-modeline--display)
   (add-hook 'minibuffer-setup-hook #'mini-modeline--enter-minibuffer)
   (add-hook 'minibuffer-exit-hook #'mini-modeline--exit-minibuffer)
   (add-hook 'echo-area-clear-hook #'mini-modeline--exit-minibuffer)
   ;; (add-hook 'pre-redisplay-functions #'mini-modeline--display)
   (add-hook 'pre-command-hook #'mini-modeline--pre-cmd)
+  ;; post-command-hook runs too often, not compatible with eldoc-mode
   (add-hook 'post-command-hook #'mini-modeline--post-cmd)
+  ;; (add-hook 'buffer-list-update-hook #'mini-modeline--post-cmd)
+  ;; (add-hook 'post-self-insert-hook #'mini-modeline--post-insert)
 
   ;; compatibility
   ;; anzu
@@ -457,19 +486,21 @@ BODY will be supplied with orig-func and args."
 
   (setq resize-mini-windows mini-modeline--orig-resize-mini-windows)
   (redisplay)
-  ;; (when (timerp mini-modeline--timer) (cancel-timer mini-modeline--timer))
+  (when (timerp mini-modeline--idle-timer) (cancel-timer mini-modeline--idle-timer))
   ;; (funcall 'clear-minibuffer-message)
   (message nil)
   (advice-remove #'message #'mini-modeline--reroute-msg)
   (advice-remove #'force-mode-line-update #'mini-modeline--display)
 
-  (remove-hook 'focus-in-hook 'mini-modeline--display)
+  (remove-hook 'focus-out-hook 'mini-modeline--display)
   (remove-hook 'minibuffer-setup-hook #'mini-modeline--enter-minibuffer)
   (remove-hook 'minibuffer-exit-hook #'mini-modeline--exit-minibuffer)
   (remove-hook 'echo-area-clear-hook #'mini-modeline--exit-minibuffer)
   ;; (remove-hook 'pre-redisplay-functions #'mini-modeline--display)
   (remove-hook 'pre-command-hook #'mini-modeline--pre-cmd)
   (remove-hook 'post-command-hook #'mini-modeline--post-cmd)
+  ;; (remove-hook 'buffer-list-update-hook #'mini-modeline--post-cmd)
+  ;; (remove-hook 'post-self-insert-hook #'mini-modeline--post-insert)
 
   ;; compatibility
   (advice-remove #'anzu--cons-mode-line 'mini-modeline--anzu--cons-mode-line)
@@ -491,25 +522,45 @@ BODY will be supplied with orig-func and args."
     (mini-modeline--disable)))
 
 ;; Emacs bug: too many places that write to the echo area without using message
+;; https://emacs.stackexchange.com/questions/7563/make-use-of-an-empty-echo-area-to-display-information/80156
+;; The echo area displayed is the content of ` *Echo Area 0*` or ` *Echo Area 1*` and these are "normal" buffers. It should be posible to patch Emacs so as to provide maybe a hook run whenever these buffers are "flushed" (or are displayed and empty), so that this functionality can be implemented efficiently and reliably.
+
+;; use C-g to refresh if message is blocked by echo area text
 (defun keyboard-quit ()
   "Signal a `quit' condition.
   During execution of Lisp code, this character causes a quit directly.
   At top-level, as an editor command, this simply beeps."
   (interactive)
-  ;; Avoid adding the region to the window selection.
-  (setq saved-region-selection nil)
-  (let (select-active-regions)
-    (deactivate-mark))
-  (if (fboundp 'kmacro-keyboard-quit)
-      (kmacro-keyboard-quit))
-  (when completion-in-region-mode
-    (completion-in-region-mode -1))
-  ;; Force the next redisplay cycle to remove the "Def" indicator from
-  ;; all the mode lines.
-  (if defining-kbd-macro
-      (force-mode-line-update t))
-  (setq defining-kbd-macro nil)
-  (message "Quit"))
+  (let* ((resize-mini-windows t)
+         (mini-modeline-window (minibuffer-window nil))
+         (mini-modeline-buffer (window-buffer mini-modeline-window)))
+    (if (with-current-buffer " *Echo Area 0*"
+          (let ((echo-string (buffer-string)))
+            ;; (message-log t "current echo area message: %s" echo-string)
+            (erase-buffer)
+            (string-empty-p echo-string)))
+        (progn
+          ;; Avoid adding the region to the window selection.
+          (setq saved-region-selection nil)
+          (let (select-active-regions)
+            (deactivate-mark))
+          (if (fboundp 'kmacro-keyboard-quit)
+              (kmacro-keyboard-quit))
+          (when completion-in-region-mode
+            (completion-in-region-mode -1))
+          ;; Force the next redisplay cycle to remove the "Def" indicator from
+          ;; all the mode lines.
+          (if defining-kbd-macro
+              (force-mode-line-update t))
+          (setq defining-kbd-macro nil)
+          ;; do a force window resize
+          (with-current-buffer mini-modeline-buffer
+            (erase-buffer)
+            (redisplay))
+          (message "Quit"))
+      ;; (current-message) is cleared on key press?
+      ;; clear text in echo area not printed by message, since all message is rerouted
+      (mini-modeline--display 'force))))
 
 (provide 'mini-modeline)
 ;;; mini-modeline.el ends here
