@@ -44,10 +44,6 @@
   :group 'minibuffer
   :prefix "mini-modeline-")
 
-(defcustom mini-modeline--l-format nil
-  "Left part of mini-modeline, same format with `mode-line-format'."
-  :type `(repeat symbol)
-  :group 'mini-modeline)
 
 (defcustom mini-modeline--r-format '("%e" mode-line-process
                                      mode-line-mule-info
@@ -240,6 +236,7 @@ Return value is (STRING . LINES)."
 
 (defvar mini-modeline--unprocessed-message '())
 (defvar mini-modeline-content-left-last nil)
+(defvar mini-modeline--repeat-left-last-time nil)
 
 (defun mini-modeline--display (&optional force keep-msg)
   "Update mini-modeline."
@@ -256,27 +253,37 @@ Return value is (STRING . LINES)."
                       mini-modeline-content)
                   ;; (message-log nil "mini-modeline--display, command state %s" mini-modeline--idle)
                   ;; (message-log t "current msg: %s" (current-message))
-                  (setq mini-modeline-content-left (or (and mini-modeline--unprocessed-message
-                                                            (string-join mini-modeline--unprocessed-message "\n"))
-                                                       mini-modeline-content-left-last))
-                  (setq mini-modeline-content-left-last mini-modeline-content-left
-                        mini-modeline-content (mini-modeline--multi-lr-render
-                                               (or mini-modeline-content-left (format-mode-line mini-modeline--l-format))
+                  (if mini-modeline--unprocessed-message
+                      (setq mini-modeline-content-left
+                            (string-join (last mini-modeline--unprocessed-message 3) "\n")
+                            mini-modeline-content-left-last mini-modeline-content-left)
+                    (when mini-modeline-content-left-last
+                      (setq mini-modeline-content-left mini-modeline-content-left-last)
+                      (if mini-modeline--repeat-left-last-time
+                          ;; reset mini-modeline-content-left-last after showing for at least 5 seconds
+                          (when (mini-modeline--overduep mini-modeline--repeat-left-last-time 5)
+                            (setq mini-modeline--repeat-left-last-time nil
+                                  mini-modeline-content-left-last nil))
+                        (setq mini-modeline--repeat-left-last-time (current-time)))))
+                  (setq mini-modeline-content (mini-modeline--multi-lr-render
+                                               (or mini-modeline-content-left "")
                                                (format-mode-line mini-modeline--r-format)))
-                  (unless keep-msg
-                    (setq mini-modeline--unprocessed-message '()))
-                  (setq mini-modeline--last-update-time (current-time))
+                  (cancel-timer mini-modeline--timer)
                   (setq mini-modeline--timer
                         (run-at-time 0.1 nil 'mini-modeline--set-minibuffer
                                      mini-modeline-content
                                      mini-modeline-window
-                                     mini-modeline-buffer))))))
+                                     mini-modeline-buffer
+                                     mini-modeline--unprocessed-message
+                                     keep-msg))))))
         ((error debug)
          (message-log t "mini-modeline: %s\n" err))))))
 
 (defun mini-modeline--set-minibuffer (mini-modeline-content
                                       mini-modeline-window
-                                      mini-modeline-buffer)
+                                      mini-modeline-buffer
+                                      msgs
+                                      keep-msg)
   (let* ((mini-modeline-content-height (cdr mini-modeline-content))
          (height-delta (- mini-modeline-content-height
                           (window-height mini-modeline-window)))
@@ -305,7 +312,11 @@ Return value is (STRING . LINES)."
                 (and (mini-modeline--overduep mini-modeline--last-resize 2)))
         (setq mini-modeline--last-resize (current-time))
         ;; (window--resize-mini-window mini-modeline-window height-delta)
-        (window-resize mini-modeline-window height-delta)))))
+        (window-resize mini-modeline-window height-delta)))
+    (unless keep-msg
+      (setq mini-modeline--unprocessed-message
+            (cl-set-difference msgs mini-modeline--unprocessed-message)))
+    (setq mini-modeline--last-update-time (current-time))))
 
 (setq inhibit-read-only t)
 
@@ -314,8 +325,8 @@ Return value is (STRING . LINES)."
   (let* ((inhibit-message t)
          (msg (apply func args)))
     ;; (replace-regexp-in-string "%" "%%" (substring msg 0 max-message-length))
-    (unless (and (string-empty-p msg)
-                 (equal msg (car (last mini-modeline--unprocessed-message))))
+    (unless (or (string-empty-p msg)
+                (equal msg (car (last mini-modeline--unprocessed-message))))
       ;; todo delete trailing spaces and blank lines
       (add-to-list 'mini-modeline--unprocessed-message msg t)
       ;; (message-log nil "Reroute message %s minibuffer active: %s input pending: %s"
@@ -346,13 +357,13 @@ BODY will be supplied with orig-func and args."
   ;;   (mini-modeline--display))
   ;; remove flashing, the post-command-hook is called too often, eg. in eldoc-mode
   (when (mini-modeline--overduep mini-modeline--last-update-time mini-modeline-update-interval)
-    (when (timerp mini-modeline--timer) (cancel-timer mini-modeline--timer))
+    (cancel-timer mini-modeline--timer)
     (mini-modeline--display))
   (setq echo-keystrokes mini-modeline--echo-keystrokes))
 
 (defsubst mini-modeline--post-insert ()
   "Post insert hook of mini-modeline."
-  (when (timerp mini-modeline--timer) (cancel-timer mini-modeline--timer))
+  (cancel-timer mini-modeline--timer)
   (mini-modeline--display 'force))
 
 (defvar mini-modeline--orig-resize-mini-windows resize-mini-windows)
@@ -413,7 +424,7 @@ BODY will be supplied with orig-func and args."
   (setq resize-mini-windows nil)
   (redisplay)
 
-  (defvar mini-modeline--timer nil)
+  (defvar mini-modeline--timer (timer--create))
   (defvar mini-modeline--idle-timer nil)
 
   (setq mini-modeline--idle-timer (run-with-idle-timer 5 t #'mini-modeline--display))
@@ -445,6 +456,13 @@ BODY will be supplied with orig-func and args."
    (let ((mode-line-format mini-modeline--r-format))
      (apply orig-func args)
      (setq mini-modeline--r-format mode-line-format)))
+
+  ;; y-or-n-p and map-y-or-n-p uses message to display prompt
+  ;; (mini-modeline--wrap
+  ;;  map-y-or-n-p
+  ;;  (progn
+  ;;    (setq mini-modeline--idle nil)
+  ;;    (apply orig-func args)))
 
   ;; read-key-sequence
   (mini-modeline--wrap
@@ -557,9 +575,11 @@ BODY will be supplied with orig-func and args."
           (with-current-buffer mini-modeline-buffer
             (erase-buffer)
             (redisplay))
+          (setq mini-modeline--unprocessed-message '())
           (message "Quit"))
       ;; (current-message) is cleared on key press?
       ;; clear text in echo area not printed by message, since all message is rerouted
+      (setq mini-modeline-content-left-last nil)
       (mini-modeline--display 'force))))
 
 (provide 'mini-modeline)
