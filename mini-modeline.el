@@ -136,25 +136,14 @@ Set this to the minimal value that doesn't cause truncation."
       (with-current-buffer "*Messages*"
         (let ((inhibit-read-only t)
               (log-text (apply #'format args)))
+          (notify "message:" log-text)
           (goto-char (point-max))
           (insert log-text)
-          (insert "\n")
-          (notify "message:" log-text))))))
+          (insert "\n"))))))
 
 (defun message-log-flag-toggle ()
   (interactive)
   (setq message-log-flag (not message-log-flag)))
-
-(defun message-log (force &rest args)
-  "Log message into message buffer with ARGS as same parameters in `message'."
-  (when (or message-log-flag force)
-    (save-excursion
-      (with-current-buffer "*Messages*"
-        (let ((inhibit-read-only t)
-              (log-text (apply #'format args)))
-          (goto-char (point-max))
-          (insert log-text)
-          (insert "\n"))))))
 
 (defun mini-modeline--show-buffers ()
   (interactive)
@@ -190,7 +179,7 @@ Set this to the minimal value that doesn't cause truncation."
               (cons (format (format "%%s %%%d.%ds" available-width available-width) left right)
                     0)
             (cons
-             (format (format "%%%d.%ds\n%%s" (- frame-width 1) (- frame-width 1)) right left)
+             (format (format "%%s\n%%%d.%ds" (- frame-width 1) (- frame-width 1)) left right)
              (ceiling (string-width left) frame-width)))
         (cons (format (format "%%s %%%ds" available-width) left right) 0))))
 
@@ -381,6 +370,46 @@ BODY will be supplied with orig-func and args."
 (declare-function anzu--cons-mode-line "ext:anzu")
 (declare-function anzu--reset-mode-line "ext:anzu")
 
+;; Emacs bug: too many places that write to the echo area without using message
+;; https://emacs.stackexchange.com/questions/7563/make-use-of-an-empty-echo-area-to-display-information/80156
+;; The echo area displayed is the content of ` *Echo Area 0*` or ` *Echo Area 1*` and these are "normal" buffers. It should be posible to patch Emacs so as to provide maybe a hook run whenever these buffers are "flushed" (or are displayed and empty), so that this functionality can be implemented efficiently and reliably.
+
+;; use C-g to refresh if message is blocked by echo area text
+(defun mini-modeline-keyboard-quit (orign-fun)
+  "Signal a `quit' condition.
+  During execution of Lisp code, this character causes a quit directly.
+  At top-level, as an editor command, this simply beeps."
+  (interactive)
+  (let* ((resize-mini-windows t)
+         (mini-modeline-window (minibuffer-window nil))
+         (minibuf (active-minibuffer-window)))
+    (when minibuf (with-current-buffer (window-buffer minibuf)
+                    (minibuffer-keyboard-quit)))
+    (if (with-current-buffer " *Echo Area 0*"
+          (let ((echo-string (buffer-string)))
+            ;; (message-log t "current echo area message: %s" echo-string)
+            (erase-buffer)
+            (string-empty-p echo-string)))
+        (progn
+          ;; Avoid adding the region to the window selection.
+          (setq saved-region-selection nil)
+          (let (select-active-regions)
+            (deactivate-mark))
+          (if (fboundp 'kmacro-keyboard-quit)
+              (kmacro-keyboard-quit))
+          (when completion-in-region-mode
+            (completion-in-region-mode -1))
+          (setq defining-kbd-macro nil))
+      (setq mini-modeline--unprocessed-message '())
+      ;; (current-message) is cleared on key press?
+      ;; clear text in echo area not printed by message, since all message is rerouted
+      (setq mini-modeline-content-left-last nil)
+      ;; (with-current-buffer mini-modeline-buffer
+      ;;   ;; do a force window resize
+      ;;   (erase-buffer)
+      ;;   (redisplay))
+      (mini-modeline--display 'force))))
+
 (defun mini-modeline--enable ()
   "Enable `mini-modeline'."
   ;; Hide modeline for terminal, or use empty modeline for GUI.
@@ -432,6 +461,7 @@ BODY will be supplied with orig-func and args."
   (setq message-original (symbol-function 'message))
   (advice-add #'message :around #'mini-modeline--reroute-msg)
   (advice-add #'force-mode-line-update :after #'mini-modeline--display)
+  (advice-add #'keyboard-quit :around #'mini-modeline-keyboard-quit)
 
   (add-hook 'focus-out-hook 'mini-modeline--display)
   (add-hook 'minibuffer-setup-hook #'mini-modeline--enter-minibuffer)
@@ -509,6 +539,7 @@ BODY will be supplied with orig-func and args."
   (message nil)
   (advice-remove #'message #'mini-modeline--reroute-msg)
   (advice-remove #'force-mode-line-update #'mini-modeline--display)
+  (advice-remove #'keyboard-quit #'mini-modeline-keyboard-quit)
 
   (remove-hook 'focus-out-hook 'mini-modeline--display)
   (remove-hook 'minibuffer-setup-hook #'mini-modeline--enter-minibuffer)
@@ -527,7 +558,6 @@ BODY will be supplied with orig-func and args."
   (advice-remove #'read-key-sequence 'mini-modeline--read-key-sequence)
   (advice-remove #'read-key-sequence-vector 'mini-modeline--read-key-sequence-vector))
 
-
 ;;;###autoload
 (define-minor-mode mini-modeline-mode
   "Enable modeline in minibuffer."
@@ -538,49 +568,6 @@ BODY will be supplied with orig-func and args."
   (if mini-modeline-mode
       (mini-modeline--enable)
     (mini-modeline--disable)))
-
-;; Emacs bug: too many places that write to the echo area without using message
-;; https://emacs.stackexchange.com/questions/7563/make-use-of-an-empty-echo-area-to-display-information/80156
-;; The echo area displayed is the content of ` *Echo Area 0*` or ` *Echo Area 1*` and these are "normal" buffers. It should be posible to patch Emacs so as to provide maybe a hook run whenever these buffers are "flushed" (or are displayed and empty), so that this functionality can be implemented efficiently and reliably.
-
-;; use C-g to refresh if message is blocked by echo area text
-(defun keyboard-quit ()
-  "Signal a `quit' condition.
-  During execution of Lisp code, this character causes a quit directly.
-  At top-level, as an editor command, this simply beeps."
-  (interactive)
-  (let* ((resize-mini-windows t)
-         (mini-modeline-window (minibuffer-window nil))
-         (mini-modeline-buffer (window-buffer mini-modeline-window)))
-    (if (with-current-buffer " *Echo Area 0*"
-          (let ((echo-string (buffer-string)))
-            ;; (message-log t "current echo area message: %s" echo-string)
-            (erase-buffer)
-            (string-empty-p echo-string)))
-        (progn
-          ;; Avoid adding the region to the window selection.
-          (setq saved-region-selection nil)
-          (let (select-active-regions)
-            (deactivate-mark))
-          (if (fboundp 'kmacro-keyboard-quit)
-              (kmacro-keyboard-quit))
-          (when completion-in-region-mode
-            (completion-in-region-mode -1))
-          ;; Force the next redisplay cycle to remove the "Def" indicator from
-          ;; all the mode lines.
-          (if defining-kbd-macro
-              (force-mode-line-update t))
-          (setq defining-kbd-macro nil)
-          ;; do a force window resize
-          (with-current-buffer mini-modeline-buffer
-            (erase-buffer)
-            (redisplay))
-          (setq mini-modeline--unprocessed-message '())
-          (message "Quit"))
-      ;; (current-message) is cleared on key press?
-      ;; clear text in echo area not printed by message, since all message is rerouted
-      (setq mini-modeline-content-left-last nil)
-      (mini-modeline--display 'force))))
 
 (provide 'mini-modeline)
 ;;; mini-modeline.el ends here
